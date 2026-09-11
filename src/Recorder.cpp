@@ -1276,17 +1276,6 @@ struct RecorderWidget : ModuleWidget {
 		}
 
 		menu->addChild(new MenuSeparator);
-		menu->addChild(createMenuLabel("Video formats"));
-
-		for (const std::string &format : VIDEO_FORMATS) {
-			const FormatInfo &fi = FORMAT_INFO.at(format);
-			menu->addChild(createCheckMenuItem(fi.name + " (." + fi.extension + ")", "",
-				[=]() {return format == module->format;},
-				[=]() {module->setFormat(format);}
-			));
-		}
-
-		menu->addChild(new MenuSeparator);
 		menu->addChild(createMenuLabel("Encoder settings"));
 
 		menu->addChild(createSubmenuItem("Sample rate", string::f("%g kHz", module->sampleRate / 1000.0),
@@ -1333,43 +1322,9 @@ struct RecorderWidget : ModuleWidget {
 		// ));
 	}
 
-	void step() override {
-		ModuleWidget::step();
-		if (!this->module)
-			return;
-		Recorder *module = dynamic_cast<Recorder*>(this->module);
-
-		// Get size even if video is not requested, so the size can be set when video starts recording.
-		int width, height;
-		glfwGetFramebufferSize(APP->window->win, &width, &height);
-		module->setSize(width, height);
-
-		if (module->needsVideo()) {
-			// glReadPixels defaults to GL_BACK, but the back-buffer is unstable, so use the front buffer (what the user sees)
-			glReadBuffer(GL_FRONT);
-			// Get pixel color data
-			uint8_t *data = new uint8_t[height * width * 4];
-			glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data);
-
-			if (cursor && glfwGetInputMode(APP->window->win, GLFW_CURSOR) == GLFW_CURSOR_NORMAL) {
-				// Get mouse position
-				double cursorXd, cursorYd;
-				glfwGetCursorPos(APP->window->win, &cursorXd, &cursorYd);
-				int cursorX = (int) std::round(cursorXd);
-				int cursorY = (int) std::round(cursorYd);
-				// Offset cursor
-				cursorX -= 3;
-				cursorY -= 3;
-
-				// Draw cursor
-				blitRGBA(data, width, height, width * 4, cursor, cursorWidth, cursorHeight, cursorWidth * 4, cursorX, height - cursorY - cursorHeight);
-			}
-
-			module->writeVideo(data, width, height);
-
-			delete[] data;
-		}
-	}
+	// Upstream captures the framebuffer here for video recording, through glfw
+	// calls Cardinal has no window for: it draws through DPF. Video is dropped
+	// from this fork, so the widget keeps the plain step.
 };
 
 
