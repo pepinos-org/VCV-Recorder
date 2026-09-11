@@ -680,6 +680,12 @@ struct Encoder {
 ////////////////////
 
 
+/** Cardinal hands a finished file to the system picker on iOS, where writing
+    into the app's own folder gets it nowhere the user can reach. Weak, so this
+    builds and runs unchanged where the host provides nothing. */
+extern "C" void cardinalExportFile(const char* path) __attribute__((weak));
+
+
 struct Recorder : Module {
 	enum ParamIds {
 		GAIN_PARAM,
@@ -714,6 +720,7 @@ struct Recorder : Module {
 	// Settings. Copied to Encoder when created.
 	std::string format;
 	std::string path;
+	std::string recordedPath;
 	std::string directory;
 	std::string basename;
 	bool incrementPath;
@@ -888,6 +895,8 @@ struct Recorder : Module {
 
 		encoder = new Encoder;
 		encoder->open(format, newPath, channels, sampleRate, depth, bitRate, width, height);
+		// What was actually written: with incrementPath, path is only the base
+		recordedPath = newPath;
 		if (!encoder->isOpen()) {
 			delete encoder;
 			encoder = NULL;
@@ -897,11 +906,19 @@ struct Recorder : Module {
 	}
 
 	void stop() {
-		std::lock_guard<std::mutex> lock(encoderMutex);
-		if (encoder) {
-			delete encoder;
-			encoder = NULL;
+		std::string written;
+		{
+			std::lock_guard<std::mutex> lock(encoderMutex);
+			if (encoder) {
+				delete encoder;
+				encoder = NULL;
+				written = recordedPath;
+			}
 		}
+
+		// Offer what was just recorded, once the encoder has closed the file
+		if (!written.empty() && cardinalExportFile != NULL)
+			cardinalExportFile(written.c_str());
 	}
 
 	bool isRecording() {
