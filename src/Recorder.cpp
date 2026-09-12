@@ -5,6 +5,8 @@
 #include <atomic>
 #include <thread>
 #include <condition_variable>
+#include <ctime>
+#include <patch.hpp>
 #include <stb_image.h>
 
 extern "C" {
@@ -721,6 +723,10 @@ struct Recorder : Module {
 	std::string format;
 	std::string path;
 	std::string recordedPath;
+	// The take most recently started, kept so the menu can offer it up after
+	// the fact. Written by the engine thread, read by the widget.
+	std::string lastTakePath;
+	std::mutex lastTakeMutex;
 	std::string directory;
 	std::string basename;
 	bool incrementPath;
@@ -872,24 +878,56 @@ struct Recorder : Module {
 		}
 	}
 
+	/** Where a take goes when nobody has said. Named after the patch and the
+	    moment, in the recordings folder: recording must not stop to ask, and
+	    not asking is only fair if the file can be found again afterwards.
+	    Timestamps also never collide, so nothing has to be probed for. */
+	std::string autoTakePath() {
+		std::string dir = lastRecordingsDirectory;
+		if (dir == "" || !system::isDirectory(dir)) {
+			dir = asset::user("recordings");
+			system::createDirectory(dir);
+		}
+
+		std::string stem;
+		if (APP->patch != NULL)
+			stem = system::getStem(APP->patch->path);
+		if (stem == "")
+			stem = "Cardinal";
+
+		const std::time_t now = std::time(NULL);
+		char stamp[24] = {};
+		if (const std::tm* const tm = std::localtime(&now))
+			std::strftime(stamp, sizeof(stamp) - 1, "%Y%m%d-%H%M%S", tm);
+
+		return dir + "/" + stem + "-" + stamp + "." + FORMAT_INFO.at(format).extension;
+	}
+
 	void start() {
 		stop();
 		std::lock_guard<std::mutex> lock(encoderMutex);
 
-		if (path == "")
-			return;
-
-		std::string newPath = path;
-		if (incrementPath) {
-			std::string extension = FORMAT_INFO.at(format).extension;
-			for (int i = 0; i <= 999; i++) {
-				newPath = directory + "/" + basename;
-				if (i > 0)
-					newPath += string::f("-%03d", i);
-				newPath += "." + extension;
-				// Skip if file exists
-				if (!system::isFile(newPath))
-					break;
+		// Recording never waits to be told where to write: with no destination
+		// chosen it names the take itself. The button used to open a modal save
+		// dialog first, which Cardinal's asynchronous file browser cannot do --
+		// so the press did nothing whatsoever.
+		std::string newPath;
+		if (basename == "") {
+			newPath = autoTakePath();
+		}
+		else {
+			const std::string extension = FORMAT_INFO.at(format).extension;
+			newPath = directory + "/" + basename + "." + extension;
+			if (incrementPath) {
+				for (int i = 0; i <= 999; i++) {
+					newPath = directory + "/" + basename;
+					if (i > 0)
+						newPath += string::f("-%03d", i);
+					newPath += "." + extension;
+					// Skip if file exists
+					if (!system::isFile(newPath))
+						break;
+				}
 			}
 		}
 
@@ -897,6 +935,10 @@ struct Recorder : Module {
 		encoder->open(format, newPath, channels, sampleRate, depth, bitRate, width, height);
 		// What was actually written: with incrementPath, path is only the base
 		recordedPath = newPath;
+		{
+			std::lock_guard<std::mutex> takeLock(lastTakeMutex);
+			lastTakePath = newPath;
+		}
 		if (!encoder->isOpen()) {
 			delete encoder;
 			encoder = NULL;
@@ -923,6 +965,68 @@ struct Recorder : Module {
 
 	bool isRecording() {
 		return !!encoder;
+	}
+
+	std::string getLastTake() {
+		std::lock_guard<std::mutex> lock(lastTakeMutex);
+		return lastTakePath;
+	}
+
+	/** Moves the finished take wherever the user wants it, on request only.
+	    Cancelling leaves it in the recordings folder. UI thread. */
+	void saveLastTakeDialog() {
+		const std::string recorded = getLastTake();
+		if (recorded == "" || isRecording() || !system::isFile(recorded))
+			return;
+
+		const std::string dir = system::getDirectory(recorded);
+		const std::string name = system::getFilename(recorded);
+		const std::string suffix = "." + FORMAT_INFO.at(format).extension;
+
+		const auto relocate = [](std::string recorded, std::string chosen, std::string suffix) {
+			if (chosen.size() < suffix.size()
+				|| chosen.compare(chosen.size() - suffix.size(), suffix.size(), suffix) != 0)
+				chosen += suffix;
+			if (chosen == recorded)
+				return;
+			// rename fails across filesystems; copy and drop the original
+			if (!system::rename(recorded, chosen)) {
+				if (!system::copy(recorded, chosen))
+					return;
+				system::remove(recorded);
+			}
+			lastRecordingsDirectory = system::getDirectory(chosen);
+		};
+
+	   #ifdef USING_CARDINAL_NOT_RACK
+		async_dialog_filebrowser(true, name.c_str(), dir.c_str(), "Save recording",
+			[this, recorded, suffix, relocate](char* pathC) {
+				if (pathC == NULL)
+					return;
+				const std::string chosen = pathC;
+				std::free(pathC);
+				relocate(recorded, chosen, suffix);
+				std::lock_guard<std::mutex> lock(lastTakeMutex);
+				if (lastTakePath == recorded)
+					lastTakePath = chosen;
+			});
+	   #else
+		char* pathC = osdialog_file(OSDIALOG_SAVE, dir.c_str(), name.c_str(), NULL);
+		if (pathC == NULL)
+			return;
+		const std::string chosen = pathC;
+		std::free(pathC);
+		relocate(recorded, chosen, suffix);
+		std::lock_guard<std::mutex> lock(lastTakeMutex);
+		if (lastTakePath == recorded)
+			lastTakePath = chosen;
+	   #endif
+	}
+
+	void revealLastTake() {
+		const std::string recorded = getLastTake();
+		if (recorded != "")
+			system::openDirectory(system::getDirectory(recorded));
 	}
 
 	void writeVideo(uint8_t *data, int width, int height) {
@@ -1023,6 +1127,19 @@ struct Recorder : Module {
 		}
 
 		// Open dialog
+	   #ifdef USING_CARDINAL_NOT_RACK
+		// Cardinal's browser is asynchronous: osdialog_file blocks the very
+		// thread the dialog has to be drawn from, so it never appears.
+		async_dialog_filebrowser(true, filename.c_str(), dir.c_str(), "Output file",
+			[this](char* pathC) {
+				if (pathC == NULL)
+					return;
+				const std::string picked = pathC;
+				std::free(pathC);
+				setPath(picked);
+				lastRecordingsDirectory = system::getDirectory(picked);
+			});
+	   #else
 		char* pathC = osdialog_file(OSDIALOG_SAVE, dir.c_str(), filename.c_str(), NULL);
 		if (!pathC) {
 			return;
@@ -1032,6 +1149,7 @@ struct Recorder : Module {
 
 		setPath(path);
 		lastRecordingsDirectory = system::getDirectory(path);
+	   #endif
 	}
 
 	void setSampleRate(int sampleRate) {
@@ -1152,10 +1270,9 @@ struct RecordButton : LightButton<VCVBezelBig, VCVBezelLightBig<RedLight>> {
 	void onDragStart(const event::DragStart &e) override {
 		Recorder* module = dynamic_cast<Recorder*>(this->module);
 		if (e.button == GLFW_MOUSE_BUTTON_LEFT) {
-			if (module) {
-				module->selectPathDialog(true);
+			// Records at once; where it ends up is the menu's business
+			if (module)
 				module->recClicked = true;
-			}
 		}
 
 		LightButton::onDragStart(e);
@@ -1275,11 +1392,33 @@ struct RecorderWidget : ModuleWidget {
 		menu->addChild(createMenuLabel("Output file"));
 
 		std::string path = string::ellipsizePrefix(module->path, 30);
-		menu->addChild(createMenuItem((path != "") ? path : "Select...", "",
+		menu->addChild(createMenuItem((path != "") ? path : "Automatic (patch name and time)", "",
 			[=]() {module->selectPathDialog();}
 		));
 
+		// Without this a fixed destination is a one-way door: there would be no
+		// way back to naming takes automatically.
+		menu->addChild(createMenuItem("Clear", "",
+			[=]() {module->setPath("");}, module->path == ""
+		));
+
 		menu->addChild(createBoolPtrMenuItem("Append -001, -002, etc.", "", &module->incrementPath));
+
+		// Nothing is asked while recording, so the take is offered up here
+		// instead -- named, saved elsewhere or shown in the file browser.
+		const std::string lastTake = module->getLastTake();
+		const bool noTake = lastTake == "";
+		menu->addChild(new MenuSeparator);
+		menu->addChild(createMenuLabel("Last recording"));
+		menu->addChild(createMenuLabel(noTake
+			? "(none yet)"
+			: string::ellipsizePrefix(system::getFilename(lastTake), 30)));
+		menu->addChild(createMenuItem("Save as...", "",
+			[=]() {module->saveLastTakeDialog();}, noTake || module->isRecording()
+		));
+		menu->addChild(createMenuItem("Show in file browser", "",
+			[=]() {module->revealLastTake();}, noTake
+		));
 
 		menu->addChild(new MenuSeparator);
 		menu->addChild(createMenuLabel("Audio formats"));
