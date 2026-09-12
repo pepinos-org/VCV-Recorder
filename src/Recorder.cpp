@@ -712,6 +712,7 @@ struct Recorder : Module {
 
 	dsp::ClockDivider gateDivider;
 	dsp::SchmittTrigger trigTrigger;
+	dsp::BooleanTrigger recTrigger;
 	dsp::VuMeter2 vuMeter[2];
 	dsp::ClockDivider lightDivider;
 	Encoder *encoder = NULL;
@@ -818,6 +819,12 @@ struct Recorder : Module {
 	}
 
 	void process(const ProcessArgs &args) override {
+		// Latched here rather than in the button widget, so a press counts
+		// whatever set it -- mouse, a MIDI map, host automation -- and so one
+		// shorter than gateDivider's period cannot fall between its ticks.
+		if (recTrigger.process(params[REC_PARAM].getValue() > 0.f))
+			recClicked = true;
+
 		if (gateDivider.process()) {
 			// Recording state
 			bool gate = isRecording();
@@ -1265,19 +1272,9 @@ struct Recorder : Module {
 ////////////////////
 
 
-struct RecordButton : LightButton<VCVBezelBig, VCVBezelLightBig<RedLight>> {
-	// Instead of using onAction() which is called on mouse up, handle on mouse down
-	void onDragStart(const event::DragStart &e) override {
-		Recorder* module = dynamic_cast<Recorder*>(this->module);
-		if (e.button == GLFW_MOUSE_BUTTON_LEFT) {
-			// Records at once; where it ends up is the menu's business
-			if (module)
-				module->recClicked = true;
-		}
-
-		LightButton::onDragStart(e);
-	}
-};
+// A momentary button is all this needs: the engine watches REC_PARAM itself,
+// and Switch already raises it on mouse down rather than on release.
+using RecordButton = LightButton<VCVBezelBig, VCVBezelLightBig<RedLight>>;
 
 
 struct RecLight : RedLight {
